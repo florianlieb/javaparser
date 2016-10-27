@@ -66,6 +66,138 @@ import static com.github.javaparser.ast.type.ArrayType.*;
  */
 final class ASTParser {
 
+    // START enhancement for OrganizeImport
+    Map<String,Set<String>> relation = new HashMap<String,Set<String>>();
+    Map<String,String> shortcut = new HashMap<String,String>();
+    Set<String> importNames = new HashSet<String>();
+    Set<String> staticMethods = new HashSet<String>();
+   
+    String thisClass = null;
+    String thisPackage = null;
+   
+    public int phase = 0;
+   
+    public TokenOutputter out = null;
+   
+    Token recent = null;
+    boolean recentWritten = false;
+
+  public static void main(String args[]) {
+    try {
+        ASTParser parser;
+        File fleUgly = new File(args[0] + ".ugly");
+        if (fleUgly.exists()) {
+            System.err.println(fleUgly+" already exists"); 
+            return;
+        }
+        
+        File fleBeauty = new File(args[0]);
+        if (!fleBeauty.renameTo(fleUgly))
+            throw new IOException("could not rename "+args[0]);
+
+        java.nio.charset.Charset encoding = java.nio.charset.StandardCharsets.UTF_8;
+        
+        parser = new ASTParser(new StreamProvider(new java.io.FileInputStream(fleUgly), encoding.name()));
+        parser.phase = 0;
+
+
+        parser.CompilationUnit();
+        FileWriter w = new FileWriter(args[0]);
+        parser.out = new TokenOutputter(w);
+        parser.phase = 1;
+        parser.analyzeRelations();
+        parser.ReInit(new StreamProvider(new java.io.FileInputStream(fleUgly), encoding.name()));
+        parser.CompilationUnit();
+        w.flush();
+        w.close();
+
+        System.out.println("Java program parsed successfully.");
+    } catch (Exception e) {
+      System.err.println(e.getMessage());
+      System.err.println("Encountered errors during parse.");
+    }
+  }
+
+
+   public void addStaticMethod(String strQName)
+   {
+        staticMethods.add(strQName);
+   }
+   
+    public void analyzeRelations()
+    {
+        for(Map.Entry<String, Set<String>> e : relation.entrySet())
+        {
+            if (e.getValue().size() == 1)
+            {
+                String strQName = e.getValue().iterator().next();
+                String strShort = e.getKey();
+                shortcut.put(strQName, e.getKey());
+                
+                if (! (strQName.startsWith("java.lang.") || 
+                    strShort.equals("Integer") ||
+                    strShort.equals("Long") ||
+                    strShort.equals("Float") ||
+                    strShort.equals("Double") ||
+                    strShort.equals("String") ||
+                    strShort.equals("System") ||
+                    strQName.equals(thisClass) || 
+                    strQName.startsWith(thisClass + ".") ||
+                    // REVIEW: gibt das evtl. Konflikte mit inneren Klassen?
+                    (strQName.startsWith(thisPackage + ".") && strQName.indexOf('.', thisPackage.length() + 1) == -1)
+                    )
+                    && strQName.indexOf(".") != -1) 
+                    importNames.add(strQName);
+            }
+        }
+    }
+
+    void addRelation(String strQName)
+    {
+        String strShort = strQName.substring(strQName.lastIndexOf('.') + 1);
+        addRelation(strShort, strQName);
+//          if (strQName.startsWith(thisClass + "."))
+//          {
+//          addRelation(strQName.substring(thisClass.length() + 1), strQName);
+//          }
+//          else
+//          {
+//          }
+    }
+   
+    void addRelation(String strShort, String strLong)
+    {
+        Set<String> longs = relation.get(strShort);
+        if (longs == null)
+            relation.put(strShort, longs = new HashSet<String>());
+        longs.add(strLong);
+    }
+    
+    
+    void flushTokens()
+    {
+        Token t = recent;
+        if (t != token || !recentWritten)
+        {
+            while (t != null && t.kind != EOF)
+            {
+                if (!recentWritten)
+                    out.write(t);
+                    
+                recentWritten = false;
+                if (t == token)
+                    break;
+                    
+                t = t.next;
+            }
+        }
+        recent = getToken(1);
+        recentWritten = false;
+    }
+    
+    // END enhancement for OrganizeImport
+
+
     private final Position INVALID = pos(-1, 0);
     List<Problem> problems = new ArrayList<Problem>();
 
@@ -1282,13 +1414,46 @@ CompilationUnit CompilationUnit():
 	NodeList<TypeDeclaration<?>> types = emptyList();
 	TypeDeclaration tn = null;
 	Position begin = INVALID;
+	
+    if (phase == 1)
+    {
+        recent = getToken(1);
+        recentWritten = false;
+    }
 }
 {
   [ LOOKAHEAD(PackageDeclaration()) pakage = PackageDeclaration() {begin = begin.orIfInvalid(pakage.getBegin());} ]
   ( in = ImportDeclaration()      { begin = begin.orIfInvalid(in.getBegin()); imports = add(imports, in); } )*
+
+  {
+    if (phase == 1)
+    {
+        flushTokens();
+        out.endln();
+        List<String> sortedImports = new ArrayList<String>(importNames);
+        Collections.sort(sortedImports);
+        String recentTopPackage = null;
+        for (String strImport : sortedImports )
+        {
+            String nextTopPackage = strImport.substring(0, strImport.indexOf('.'));
+            if (nextTopPackage.length() > 0) {
+                if (recentTopPackage == null || !recentTopPackage.equals(nextTopPackage)) {
+                    out.endln();
+                    recentTopPackage = nextTopPackage;
+                }
+            }
+            out.writeln("import "+strImport+";");
+        }
+        out.endln();
+    }
+  }
+  
   ( tn = TypeDeclaration() { begin = begin.orIfInvalid(tn.getBegin()); types = add(types, tn); } )*
   (<EOF> | "\u001A" /** ctrl+z char **/)
-  { return new CompilationUnit(begin.invalid() ? Range.UNKNOWN : range(begin, tokenEnd()), pakage, imports, types); }
+  {
+    flushTokens();
+    return new CompilationUnit(begin.invalid() ? Range.UNKNOWN : range(begin, tokenEnd()), pakage, imports, types);
+  }
 }
 
 PackageDeclaration PackageDeclaration():
@@ -1296,11 +1461,19 @@ PackageDeclaration PackageDeclaration():
 	NodeList<AnnotationExpr> annotations = new NodeList<AnnotationExpr>();
 	NameExpr name;
 	Position begin;
+    String nameString;
 }
 {
   annotations = Annotations() 
   "package" {begin = tokenBegin();}  name = Name() ";"
-  { return new PackageDeclaration(range(begin, tokenEnd()), annotations, name); }
+  {
+     nameString = name.getQualifiedName();
+     if (phase == 0) {
+	        thisClass = nameString;
+	        thisPackage = nameString;
+	 }
+     return new PackageDeclaration(range(begin, tokenEnd()), annotations, name);
+  }
 }
 
 ImportDeclaration ImportDeclaration():
@@ -1388,18 +1561,18 @@ TypeDeclaration TypeDeclaration():
   |
     modifier = Modifiers()
     (
-       ret = ClassOrInterfaceDeclaration(modifier)
+       ret = ClassOrInterfaceDeclaration(modifier, true)
      |
-       ret = EnumDeclaration(modifier)
+       ret = EnumDeclaration(modifier, true)
      |
-       ret = AnnotationTypeDeclaration(modifier)
+       ret = AnnotationTypeDeclaration(modifier, true)
     )
   )
   { return ret; }
 }
 
 
-ClassOrInterfaceDeclaration ClassOrInterfaceDeclaration(ModifierHolder modifier):
+ClassOrInterfaceDeclaration ClassOrInterfaceDeclaration(ModifierHolder modifier, boolean bTopLevel):
 {
     boolean isInterface = false;
     NameExpr name;
@@ -1412,6 +1585,18 @@ ClassOrInterfaceDeclaration ClassOrInterfaceDeclaration(ModifierHolder modifier)
 {
   ( "class" | "interface" { isInterface = true; } ) { begin = begin.orIfInvalid(tokenBegin()); }
   name = Name()
+  {
+    if (bTopLevel && phase == 0)
+    {
+        if (thisClass == null)
+            thisClass = name.getName();
+        else
+            thisClass += "." + name.getName();
+            
+        addRelation(thisClass);
+    }
+  }
+  
   [ typePar = TypeParameters() ]
   [ extList = ExtendsList(isInterface) ]
   [ impList = ImplementsList(isInterface) ]
@@ -1451,7 +1636,7 @@ NodeList<ClassOrInterfaceType> ImplementsList(boolean isInterface):
    { return ret; }
 }
 
-EnumDeclaration EnumDeclaration(ModifierHolder modifier):
+EnumDeclaration EnumDeclaration(ModifierHolder modifier, boolean bTopLevel):
 {
 	NameExpr name;
     NodeList<ClassOrInterfaceType> impList = emptyList();
@@ -1464,6 +1649,18 @@ EnumDeclaration EnumDeclaration(ModifierHolder modifier):
 {
   "enum" { begin = begin.orIfInvalid(tokenBegin()); }
   name = Name()
+  {
+    if (bTopLevel && phase == 0)
+    {
+        if (thisClass == null)
+            thisClass = name.getName();
+        else
+            thisClass += "." + name.getName();
+            
+        addRelation(thisClass);
+    }
+  }
+  
   [ impList = ImplementsList(false) ]
   "{"
   	[
@@ -1581,11 +1778,11 @@ BodyDeclaration<?> ClassOrInterfaceBodyDeclaration(boolean isInterface):
 				// Just get all the modifiers out of the way. If you want to do
 	              // more checks, pass the modifiers down to the member
 	  (
-	      ret = ClassOrInterfaceDeclaration(modifier)
+	      ret = ClassOrInterfaceDeclaration(modifier, false)
 	    |
-	      ret = EnumDeclaration(modifier)
+	      ret = EnumDeclaration(modifier, false)
 	    |
-	      ret = AnnotationTypeDeclaration(modifier)
+	      ret = AnnotationTypeDeclaration(modifier, false)
 	    |
 	      LOOKAHEAD( [ TypeParameters() ] <IDENTIFIER> "(" )
 	      ret = ConstructorDeclaration(modifier)
@@ -1939,20 +2136,46 @@ ClassOrInterfaceType AnnotatedClassOrInterfaceType():
 
 ClassOrInterfaceType ClassOrInterfaceType():
 {
+    Token t0;
 	ClassOrInterfaceType ret;
 	String name;
 	RangedList<Type<?>> typeArgs = new RangedList<Type<?>>(null);
 	Position begin;
 	NodeList<AnnotationExpr> annotations = new NodeList<AnnotationExpr>();
+
+    StringBuilder sb = new StringBuilder();
+    if (phase == 1)
+        flushTokens();
 }
 {
-  <IDENTIFIER> {begin=tokenBegin();} { name = token.image; }
+  <IDENTIFIER> {begin=tokenBegin();} { name = token.image; t0 = token; sb.append(name); }
   [ LOOKAHEAD(2) typeArgs = TypeArguments() ]
   {
       ret = new ClassOrInterfaceType(range(begin, tokenEnd()),null, name, typeArgs.list);
   }
   (
-	  LOOKAHEAD(2) "." annotations = Annotations()  <IDENTIFIER> { name = token.image; }
+	  LOOKAHEAD(2) "." annotations = Annotations()  <IDENTIFIER> { name = token.image; sb.append(".").append(name); }
+      {
+        if (phase == 1)
+        {
+            String strClassQName = sb.toString();
+            String strShort = shortcut.get(strClassQName);
+            if (strShort != null)
+            {
+                if (t0.specialToken != null)
+                {
+                    out.write(t0.specialToken);
+                    if (t0.specialToken.next != null)
+                        throw new RuntimeException("TODO analyze this");
+                }
+                    
+                out.write(strShort, t0.beginLine, t0.beginColumn, strClassQName.length() - strShort.length());
+                recent = token;
+                recentWritten = true;
+                sb.setLength(0);
+            }
+        }
+      }
 	  [ LOOKAHEAD(2) typeArgs = TypeArguments() ]
 	  {
 	    ret = new ClassOrInterfaceType(range(begin, tokenEnd()),ret, name, typeArgs.list);
@@ -1960,7 +2183,21 @@ ClassOrInterfaceType ClassOrInterfaceType():
 	    annotations = null;
       }
   )*
-  { return ret; }
+  {
+    String strClassQName = sb.toString();
+    if (phase == 0) { 
+        addRelation(strClassQName);
+    } else if (phase == 1) {
+        String strShort = shortcut.get(strClassQName);
+        if (strShort != null) {
+            out.write(strShort, t0.beginLine, t0.beginColumn, strClassQName.length() - strShort.length());
+            recent = token;
+            recentWritten = true;
+        }
+    }
+    
+    return ret;
+  }
 }
 
 RangedList<Type<?>> TypeArguments():
@@ -2061,12 +2298,39 @@ NameExpr Name():
  * by a ".*" when used in the context of an "ImportDeclaration".
  */
 {
+  Token t1;
 	NameExpr ret;
 }
 {
-  <IDENTIFIER> { ret = new NameExpr(tokenRange(), token.image); }
+  <IDENTIFIER> { ret = new NameExpr(tokenRange(), token.image); t1 = token; }
   ( LOOKAHEAD(2) "." <IDENTIFIER> { ret = new QualifiedNameExpr(range(ret.getBegin(), pos(token.endLine, token.endColumn)), ret, token.image); } )*
-  { return ret; }
+  {
+    String strName = ret.getQualifiedName();
+    int nMethod = strName.lastIndexOf('.');
+    if (nMethod != -1)
+    {
+        String strClassQName = strName.substring(0, nMethod);
+        if (staticMethods.contains(strName))
+        {
+            if (phase == 0) {
+                addRelation(strClassQName);
+            } else if (phase == 1) {
+                String strShort = shortcut.get(strClassQName);
+                if (strShort != null)
+                {
+                    String strMethod = strName.substring(nMethod);
+                    t1.image = strShort + strMethod;
+                    while (t1 != token)
+                    {
+                        t1 = t1.next;
+                        t1.ignore = true;
+                    }
+                }
+            }
+        }
+    }
+    return ret;
+  }
 }
 
 NameExpr SimpleName():
@@ -2814,7 +3078,7 @@ Statement BlockStatement():
 	  LOOKAHEAD( Modifiers() ("class" | "interface") )
   	  {  }
 	  modifier = Modifiers()
-	  typeDecl = ClassOrInterfaceDeclaration(modifier) { ret = new TypeDeclarationStmt(range(typeDecl.getBegin().line, typeDecl.getBegin().column, token.endLine, token.endColumn), typeDecl); }
+	  typeDecl = ClassOrInterfaceDeclaration(modifier, false) { ret = new TypeDeclarationStmt(range(typeDecl.getBegin().line, typeDecl.getBegin().column, token.endLine, token.endColumn), typeDecl); }
 	|
   	  LOOKAHEAD(VariableDeclarationExpression() )
 	  expr = VariableDeclarationExpression() ";"
@@ -3321,7 +3585,7 @@ Expression  MemberValueArrayInitializer():
 
 /* Annotation Types. */
 
-AnnotationDeclaration AnnotationTypeDeclaration(ModifierHolder modifier):
+AnnotationDeclaration AnnotationTypeDeclaration(ModifierHolder modifier, boolean bTopLevel):
 {
 	NameExpr name;
     NodeList<BodyDeclaration<?>> members = emptyList();
@@ -3330,6 +3594,17 @@ AnnotationDeclaration AnnotationTypeDeclaration(ModifierHolder modifier):
 {
   "@" { begin=begin.orIfInvalid(tokenBegin()); }
   "interface" name = Name() members = AnnotationTypeBody()
+  {
+    if (bTopLevel && phase == 0)
+    {
+        if (thisClass == null)
+            thisClass = name.getName();
+        else
+            thisClass += "." + name.getName();
+            
+        addRelation(thisClass);
+    }
+  }
 
   { 
       return new AnnotationDeclaration(range(begin, tokenEnd()), modifier.modifiers, modifier.annotations, name, members);
@@ -3362,11 +3637,11 @@ BodyDeclaration<?> AnnotationBodyDeclaration():
 	   LOOKAHEAD(Type() <IDENTIFIER> "(")
 	   ret = AnnotationTypeMemberDeclaration(modifier)
 	  |
-	   ret = ClassOrInterfaceDeclaration(modifier)
+	   ret = ClassOrInterfaceDeclaration(modifier, false)
 	  |
-	   ret = EnumDeclaration(modifier)
+	   ret = EnumDeclaration(modifier, false)
 	  |
-	   ret = AnnotationTypeDeclaration(modifier)
+	   ret = AnnotationTypeDeclaration(modifier, false)
 	  |
 	   ret = FieldDeclaration(modifier)
     )
